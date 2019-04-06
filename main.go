@@ -4,13 +4,16 @@ import (
 	"fmt"
 	flags "github.com/jessevdk/go-flags"
 	"github.com/miekg/dns"
+	"go.uber.org/atomic"
 	"go.uber.org/ratelimit"
 	"log"
 	"math/rand"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type queryEngine struct {
@@ -36,6 +39,12 @@ var opts struct {
 	Attempts int      `short:"a" long:"attempts" default:"5" description:"Number of attempts if timeout"`
 }
 
+var stats struct {
+	queries *atomic.Uint64
+	results *atomic.Uint64
+	errored *atomic.Uint64
+}
+
 func main() {
 	args, err := flags.Parse(&opts)
 	if err != nil {
@@ -49,6 +58,11 @@ func main() {
 			opts.Servers[i] = "[" + server + "]" + ":53"
 		}
 	}
+	// Init stat counters
+	stats.queries = atomic.NewUint64(0)
+	stats.results = atomic.NewUint64(0)
+	stats.errored = atomic.NewUint64(0)
+
 	var engines []*queryEngine = make([]*queryEngine, len(args))
 	for i, prefix := range args {
 		engines[i] = new(queryEngine)
@@ -61,15 +75,21 @@ func main() {
 		go printResults(engines[i].output)
 	}
 
+	stderrStat, _ := os.Stderr.Stat()
+	stdoutStat, _ := os.Stdout.Stat()
+	if (stderrStat.Mode()&os.ModeCharDevice) != 0 && (stdoutStat.Mode()&os.ModeCharDevice) == 0 {
+		go printStatus()
+	}
 	for _, engine := range engines {
 		engine.waitGroup.Wait()
 	}
-	//go func() {
-	//	for {
-	//		time.Sleep(1 * time.Second)
-	//		log.Println(engine.waitGroup)
-	//	}
-	//}()
+}
+
+func printStatus() {
+	for {
+		fmt.Fprintf(os.Stderr, "\r%d queries, %d found", stats.queries.Load(), stats.results.Load())
+		time.Sleep(1 * time.Second)
+	}
 }
 
 func printResults(input chan *dns.PTR) {
@@ -150,6 +170,7 @@ func (engine *queryEngine) scanNextDivision(query string) {
 	// TODO randomize nameserver
 	for i := 0; i < engine.attempts; i++ {
 		msg, err = dns.Exchange(message, engine.selectServer())
+		stats.queries.Inc()
 		if err == nil {
 			break
 		}
@@ -163,13 +184,12 @@ func (engine *queryEngine) scanNextDivision(query string) {
 			for _, answer := range msg.Answer {
 				switch ptrAnswer := answer.(type) {
 				case *dns.PTR:
+					stats.results.Inc()
 					engine.output <- ptrAnswer
 				}
 			}
 			// Now leave
 		} else {
-			//log.Println("Querying subdivisions")
-
 			// Nothing here, but there is a record further down
 			if engine.subnet.IP.To4() != nil {
 				engine.waitGroup.Add(256)
